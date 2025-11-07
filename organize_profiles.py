@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""
+ICC Profile, EMX/EMY2, and PDF Organizer
+Renames and organizes color profiles and documentation by Printer and Paper Brand.
+"""
+
+import os
+import sys
+import shutil
+import hashlib
+import json
+import struct
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+import logging
+from datetime import datetime
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+    print("Warning: PyYAML not available. Install with: pip install PyYAML")
+
+try:
+    from PIL import Image
+    from PIL.TiffImagePlugin import IFDRational
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("Warning: PIL not available. Install with: pip install Pillow")
+
+
+class ICCProfileUpdater:
+    """Handle reading and updating ICC profile descriptions."""
+
+    # ASCII signature at start of ICC files
+    ICC_SIGNATURE = b'acsp'
+
+    # Tag signature for description
+    DESC_TAG = b'desc'
+
+    def __init__(self, verbose: bool = True):
+        """Initialize the updater."""
+        self.verbose = verbose
+
+    def log(self, message: str):
+        """Log a message."""
+        if self.verbose:
+            print(message)
+
+    def read_icc_profile(self, file_path: Path) -> Optional[bytes]:
+        """Read ICC profile file."""
+        try:
+            with open(file_path, 'rb') as f:
+                return f.read()
+        except Exception as e:
+            self.log(f"Error reading {file_path}: {e}")
+            return None
+
+    def write_icc_profile(self, file_path: Path, data: bytes) -> bool:
+        """Write ICC profile file."""
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(data)
+            return True
+        except Exception as e:
+            self.log(f"Error writing {file_path}: {e}")
+            return False
+
+    def validate_header(self, data: bytes) -> bool:
+        """Validate ICC profile header."""
+        if len(data) < 128:
+            return False
+        try:
+            # Check for ICC signature at offset 36
+            signature = data[36:40]
+            return signature == self.ICC_SIGNATURE
+        except Exception:
+            return False
+
+    def find_tag(self, data: bytes, tag_sig: bytes) -> Optional[Tuple[int, int]]:
+        """
+        Find tag in ICC profile.
+        Returns tuple of (offset, size) or None if not found.
+        """
+        # Parse tag table at offset 128
+        if len(data) < 132:
+            return None
+
+        try:
+            tag_count = struct.unpack('>I', data[128:132])[0]
+
+            # Each tag entry is 12 bytes: signature (4) + offset (4) + size (4)
+            for i in range(tag_count):
+                entry_offset = 132 + (i * 12)
+
+                if entry_offset + 12 > len(data):
+                    break
+
+                entry_sig = data[entry_offset:entry_offset + 4]
+                tag_offset = struct.unpack('>I', data[entry_offset + 4:entry_offset + 8])[0]
+                tag_size = struct.unpack('>I', data[entry_offset + 8:entry_offset + 12])[0]
+
+                if entry_sig == tag_sig:
+                    return (tag_offset, tag_size)
+
+            return None
+        except Exception:
+            return None
+
+    def update_description_tag(self, data: bytes, new_description: str) -> Optional[bytes]:
+        """
+        Update the description tag in an ICC profile.
+
+        The desc tag structure:
+        - Bytes 0-3: Tag signature ('desc')
+        - Bytes 4-7: Reserved (0)
+        - Bytes 8-11: ASCII description length (including null terminator)
+        - Bytes 12+: ASCII description
+        """
+        try:
+            # Find existing desc tag
+            tag_info = self.find_tag(data, self.DESC_TAG)
+
+            if not tag_info:
+                return None
+
+            old_offset, old_size = tag_info
+
+            # Create new desc tag data
+            # Limit description to ASCII, max 255 chars
+            desc_ascii = new_description.encode('ascii', errors='replace')[:255]
+
+            # Create the desc tag structure
+            desc_data = self.DESC_TAG  # 4 bytes: 'desc'
+            desc_data += b'\x00\x00\x00\x00'  # 4 bytes: reserved
+
+            desc_length = len(desc_ascii) + 1  # +1 for null terminator
+            desc_data += struct.pack('>I', desc_length)  # 4 bytes: length
+            desc_data += desc_ascii  # description
+            desc_data += b'\x00'  # null terminator
+
+            # Pad to multiple of 4 bytes (ICC requirement)
+            padding = (4 - (len(desc_data) % 4)) % 4
+            desc_data += b'\x00' * padding
+
+            new_size = len(desc_data)
+
+            # If new data is same size or smaller than old, we can safely replace
+            if new_size <= old_size:
+                # Pad the new data to match old size
+                if new_size < old_size:
+                    desc_data += b'\x00' * (old_size - new_size)
+
+                # Simple replacement
+                new_data = data[:old_offset] + desc_data + data[old_offset + old_size:]
+                return new_data
+
+            else:
+                # New description is too long to fit in-place
+                # Truncate to fit
+                max_desc_len = old_size - 12  # 12 bytes for header, rest for description
+                if max_desc_len <= 0:
+                    return None
+
+                desc_ascii = new_description.encode('ascii', errors='replace')[:max_desc_len - 1]
+
+                desc_data = self.DESC_TAG
+                desc_data += b'\x00\x00\x00\x00'
+                desc_length = len(desc_ascii) + 1
+                desc_data += struct.pack('>I', desc_length)
+                desc_data += desc_ascii
+                desc_data += b'\x00'
+
+                # Pad to old size
+                padding = old_size - len(desc_data)
+                if padding > 0:
+                    desc_data += b'\x00' * padding
+
+                new_data = data[:old_offset] + desc_data + data[old_offset + old_size:]
+                return new_data
+
+        except Exception:
+            return None
+
+    def process_profile(self, file_path: Path) -> bool:
+        """
+        Process a single ICC profile file.
+        Returns True if successful, False otherwise.
+        """
+        # Get the filename without extension as the new description
+        new_description = file_path.stem
+
+        # Read the profile
+        profile_data = self.read_icc_profile(file_path)
+        if not profile_data:
+            return False
+
+        # Validate header
+        if not self.validate_header(profile_data):
+            return False
+
+        # Update description
+        updated_data = self.update_description_tag(profile_data, new_description)
+        if not updated_data:
+            return False
+
+        # Write back
+        if self.write_icc_profile(file_path, updated_data):
+            return True
+
+        return False
+
+    def process_directory(self, directory: Path, verbose: bool = True) -> Tuple[int, int]:
+        """
+        Process all ICC profiles in a directory recursively.
+        Returns tuple of (processed, successful).
+        """
+        # Find all ICC files
+        icc_files = list(directory.rglob('*.icc'))
+        icm_files = list(directory.rglob('*.icm'))
+
+        # Filter out macOS resource forks
+        icc_files = [f for f in icc_files if '._' not in f.name]
+        icm_files = [f for f in icm_files if '._' not in f.name]
+
+        all_files = icc_files + icm_files
+
+        if verbose:
+            print(f"  Updating descriptions for {len(all_files)} profile files...")
+
+        processed = 0
+        successful = 0
+
+        for file_path in sorted(all_files):
+            processed += 1
+            if self.process_profile(file_path):
+                successful += 1
+
+        return processed, successful
+
+
+class ProfileOrganizer:
+    """Organizes ICC profiles, EMX files, and PDFs."""
+
+    # Default configuration values (fallback if config.yaml not found)
+    DEFAULT_PRINTER_NAMES = {
+        'PRO-100': 'Canon Pixma PRO-100',
+        'Pro-100': 'Canon Pixma PRO-100',
+        'pro-100': 'Canon Pixma PRO-100',
+        'pixmapro100': 'Canon Pixma PRO-100',
+        'pro100': 'Canon Pixma PRO-100',
+        'CanPro-100': 'Canon Pixma PRO-100',
+        'CanPro100': 'Canon Pixma PRO-100',
+        'canpro-100': 'Canon Pixma PRO-100',
+        'canpro100': 'Canon Pixma PRO-100',
+        'CANPRO-100': 'Canon Pixma PRO-100',
+        'CANPRO100': 'Canon Pixma PRO-100',
+        'Can6450': 'Canon iPF6450',
+        'Can8400': 'Canon iPF8400',
+        'iPF6450': 'Canon iPF6450',
+        'ipf6450': 'Canon iPF6450',
+        'iPf6450': 'Canon iPF6450',  # Lowercase 'f' variant
+        'ipf6400': 'Canon iPF6450',  # Alternative naming
+        'P700': 'Epson P700',
+        'P900': 'Epson P900',
+        'SC-P700': 'Epson P700',
+        'SC-P900': 'Epson P900',
+        'EpsSC-P700': 'Epson P700',
+        'EpsSC-P900': 'Epson P900',
+        'EpsSC-P7570': 'Epson P7570',
+        'EpsSC-P9500': 'Epson P9500',
+        'p900': 'Epson P900',
+        'P7570': 'Epson P7570',
+        'SC-P7570': 'Epson P7570',
+        'p7570': 'Epson P7570',
+        'EpsSC-P7570': 'Epson P7570',
+        'Epson SureColor P7570': 'Epson P7570',
+        'P7500': 'Epson P7500',
+        'SC-P7500': 'Epson P7500',
+        'p7500': 'Epson P7500',
+        'P9570': 'Epson P9570',
+        'SC-P9570': 'Epson P9570',
+    }
+
+    # Default paper brands
+    DEFAULT_PAPER_BRANDS = ['Moab', 'Canson', 'Hahnemuehle']
+
+    # Default brand name mappings
+    DEFAULT_BRAND_NAME_MAPPINGS = {
+        'cifa': 'Canson',
+        'CIFA': 'Canson',
+        'canson': 'Canson',
+        'Canson': 'Canson',
+        'HFA': 'Hahnemuehle',
+        'hfa': 'Hahnemuehle',
+        'Hahnemuehle': 'Hahnemuehle',
+        'hahnemuehle': 'Hahnemuehle',
+        'MOAB': 'MOAB',
+        'Moab': 'MOAB',
+        'moab': 'MOAB',
+    }
+
+    # Default printer remappings (consolidate similar printers)
+    DEFAULT_PRINTER_REMAPPINGS = {
+        'Canon iPF8400': 'Canon iPF6450',
+        'Epson P700': 'Epson P900',
+        'Epson P7500': 'Epson P7570',
+        'Epson P9500': 'Epson P7570',
+        'Epson SureColor P7570': 'Epson P7570',
+    }
+
+    def __init__(self, profiles_dir: str, output_dir: str = None, dry_run: bool = True, verbose: bool = False, interactive: bool = False, detailed: bool = False, update_descriptions: bool = True):
+        """
+        Initialize the organizer.
+
+        Args:
+            profiles_dir: Path to source /profiles directory
+            output_dir: Path to output directory (default: ./organized-profiles)
+            dry_run: If True, don't actually move files, just preview
+            verbose: If True, print detailed information (deprecated, use detailed)
+            interactive: If True, prompt user for multi-printer profiles
+            detailed: If True, show each file transformation; if False, show summary only
+            update_descriptions: If True, update ICC profile descriptions to match filenames
+        """
+        self.profiles_dir = Path(profiles_dir).resolve()
+
+        # Set output directory (default to organized-profiles sibling)
+        if output_dir is None:
+            self.output_dir = self.profiles_dir.parent / 'organized-profiles'
+        else:
+            self.output_dir = Path(output_dir).resolve()
+
+        self.dry_run = dry_run
+        self.verbose = verbose or detailed  # Keep verbose for logging, use detailed for UI
+        self.interactive = interactive
+        self.detailed = detailed
+        self.update_descriptions = update_descriptions
+
+        # Setup logging
+        self.setup_logging()
+
+        # Load configuration from config.yaml
+        self._load_config()
+
+        # Storage for file operations
+        self.operations = []  # List of (old_path, new_path) tuples
+        self.pdf_duplicates = defaultdict(list)  # Hash -> list of paths
+        self.files_renamed = []
+        self.files_deleted = []
+
+        # Cache for user choices on multi-printer files (per-file)
+        self.choices_cache_path = self.profiles_dir.parent / '.profile_choices.json'
+        self.user_choices = self._load_choices_cache()
+
+        # Global preferences for printer conflicts (e.g., when P7570 and P9570 appear together)
+        self.preferences_path = self.profiles_dir.parent / '.profile_preferences.json'
+        self.global_preferences = self._load_global_preferences()
+
+        if not self.profiles_dir.exists():
+            self.log(f"Error: {self.profiles_dir} does not exist", level='ERROR')
+            sys.exit(1)
+
+    def setup_logging(self):
+        """Setup logging configuration."""
+        log_format = '%(asctime)s - %(levelname)s - %(message)s'
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+            handlers=[
+                logging.FileHandler('profile_organizer.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def log(self, message: str, level: str = 'INFO'):
+        """Log a message."""
+        if self.verbose:
+            print(message)
+        getattr(self.logger, level.lower())(message)
+
+    def _load_config(self):
+        """Load configuration from config.yaml, fallback to defaults."""
+        config_path = Path(__file__).parent / 'config.yaml'
+
+        if config_path.exists() and YAML_AVAILABLE:
+            try:
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f) or {}
+
+                # Load and flatten printer names from canonical_name: [aliases] format
+                printer_names_raw = config.get('printer_names', {})
+                self.PRINTER_NAMES = self._flatten_mapping(printer_names_raw)
+
+                # Load paper brands
+                self.PAPER_BRANDS = config.get('paper_brands', self.DEFAULT_PAPER_BRANDS)
+
+                # Load and flatten brand name mappings from canonical_name: [aliases] format
+                brand_mappings_raw = config.get('brand_name_mappings', {})
+                self.BRAND_NAME_MAPPINGS = self._flatten_mapping(brand_mappings_raw)
+
+                # Load printer remappings (optional)
+                self.PRINTER_REMAPPINGS = config.get('printer_remappings', {})
+
+                self.log(f"Loaded configuration from {config_path}")
+                return
+            except Exception as e:
+                self.log(f"Warning: Could not load config.yaml: {e}", level='WARNING')
+
+        # Use defaults if config not found or couldn't be parsed
+        self.PRINTER_NAMES = self.DEFAULT_PRINTER_NAMES
+        self.PAPER_BRANDS = self.DEFAULT_PAPER_BRANDS
+        self.BRAND_NAME_MAPPINGS = self.DEFAULT_BRAND_NAME_MAPPINGS
+        self.PRINTER_REMAPPINGS = self.DEFAULT_PRINTER_REMAPPINGS
+
+    def _flatten_mapping(self, mapping: Dict[str, List[str]]) -> Dict[str, str]:
+        """
+        Convert a hierarchical mapping from canonical: [aliases] format to flat dict.
+
+        Input:  {'Canonical Name': ['alias1', 'alias2']}
+        Output: {'alias1': 'Canonical Name', 'alias2': 'Canonical Name'}
+        """
+        flat = {}
+        for canonical_name, aliases in mapping.items():
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    flat[alias] = canonical_name
+            else:
+                # Handle case where value is a string instead of list (shouldn't happen in new format)
+                flat[aliases] = canonical_name
+        return flat
+
+    def _normalize_brand_name(self, brand: str) -> str:
+        """Normalize brand names using the mappings."""
+        if brand in self.BRAND_NAME_MAPPINGS:
+            return self.BRAND_NAME_MAPPINGS[brand]
+        return brand
+
+    def _load_choices_cache(self) -> Dict:
+        """Load user choices from cache file."""
+        if self.choices_cache_path.exists():
+            try:
+                with open(self.choices_cache_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.log(f"Warning: Could not load choices cache: {e}", level='WARNING')
+        return {}
+
+    def _save_choices_cache(self):
+        """Save user choices to cache file."""
+        try:
+            with open(self.choices_cache_path, 'w') as f:
+                json.dump(self.user_choices, f, indent=2)
+        except Exception as e:
+            self.log(f"Warning: Could not save choices cache: {e}", level='WARNING')
+
+    def _load_global_preferences(self) -> Dict:
+        """Load global printer preferences from file."""
+        if self.preferences_path.exists():
+            try:
+                with open(self.preferences_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.log(f"Warning: Could not load preferences: {e}", level='WARNING')
+        return {}
+
+    def _save_global_preferences(self):
+        """Save global printer preferences to file."""
+        try:
+            with open(self.preferences_path, 'w') as f:
+                json.dump(self.global_preferences, f, indent=2)
+        except Exception as e:
+            self.log(f"Warning: Could not save preferences: {e}", level='WARNING')
+
+    def _find_printer_candidates(self, filename: str) -> List[Tuple[str, str]]:
+        """
+        Find all possible printer names in a filename.
+        Returns list of (printer_key, printer_name) tuples.
+        Only returns unique printer names (deduplicates by full_name).
+        """
+        name_lower = filename.lower()
+        candidates_dict = {}  # full_name -> longest_key mapping
+
+        for key, full_name in self.PRINTER_NAMES.items():
+            key_lower = key.lower()
+            if key_lower in name_lower:
+                # Keep track of the longest matching key for each printer name
+                # (to avoid duplicates like "pro100" and "pixmapro100" both matching)
+                if full_name not in candidates_dict or len(key) > len(candidates_dict[full_name][0]):
+                    candidates_dict[full_name] = (key, full_name)
+
+        # Return unique printer names only
+        return list(candidates_dict.values())
+
+    def _get_preference_key(self, candidates: List[Tuple[str, str]]) -> str:
+        """
+        Create a sorted key for printer candidates to use as a preference rule.
+        Example: candidates with P7570 and P9570 -> "P7570-P9570" or "P9570-P7570" (sorted)
+        """
+        keys = sorted([key for key, _ in candidates])
+        return "-".join(keys)
+
+    def _check_global_preference(self, candidates: List[Tuple[str, str]]) -> Optional[str]:
+        """
+        Check if there's a global preference rule for these candidates.
+        Returns the preferred printer name, or None if no preference exists.
+        """
+        pref_key = self._get_preference_key(candidates)
+        if pref_key in self.global_preferences:
+            preferred_name = self.global_preferences[pref_key]
+            return preferred_name
+        return None
+
+    def _prompt_for_printer(self, filename: str, candidates: List[Tuple[str, str]]) -> str:
+        """
+        Prompt user to choose printer when multiple printers are detected.
+        Creates a global rule for future files with the same printer combo.
+        Returns the chosen printer name.
+        """
+        print("\n" + "=" * 60)
+        print(f"Multiple printers detected in: {filename}")
+        print("=" * 60)
+
+        for i, (key, full_name) in enumerate(candidates, 1):
+            print(f"{i}. {full_name} ({key})")
+
+        while True:
+            try:
+                choice = input(f"Choose printer (1-{len(candidates)}) or 'q' to skip: ").strip()
+
+                if choice.lower() == 'q':
+                    return None
+
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(candidates):
+                    chosen = candidates[choice_idx][1]
+
+                    # Cache the per-file choice
+                    self.user_choices[filename] = chosen
+                    self._save_choices_cache()
+
+                    # Save as global preference rule for all similar files
+                    pref_key = self._get_preference_key(candidates)
+                    self.global_preferences[pref_key] = chosen
+                    self._save_global_preferences()
+
+                    print(f"✓ Applied globally: When you see {pref_key}, will use {chosen}")
+
+                    return chosen
+                else:
+                    print(f"Invalid choice. Please enter a number between 1 and {len(candidates)}")
+            except ValueError:
+                print(f"Invalid input. Please enter a number or 'q'")
+
+    def _get_printer_name_interactive(self, filename: str, detected_printer: str) -> str:
+        """
+        Get printer name, prompting user if file has multiple possible printers.
+        Uses global preferences for printer conflicts when available.
+        Returns the selected printer name.
+        """
+        # Check if we have a cached choice for this file
+        if filename in self.user_choices:
+            return self.user_choices[filename]
+
+        # Find all possible printers
+        candidates = self._find_printer_candidates(filename)
+
+        if len(candidates) > 1:
+            # Check if we have a global preference rule for this combo
+            global_pref = self._check_global_preference(candidates)
+            if global_pref:
+                return global_pref
+
+            # If no global preference and interactive mode, ask user
+            if self.interactive:
+                chosen = self._prompt_for_printer(filename, candidates)
+                return chosen if chosen else detected_printer
+            else:
+                self.log(f"  ℹ Multi-printer file: {filename} (use --interactive to choose)")
+
+        return detected_printer
+
+    def _apply_printer_remapping(self, printer_name: str) -> str:
+        """
+        Apply printer remappings defined in config.
+        If a mapping exists for this printer, return the mapped printer name.
+        Otherwise, return the original printer name.
+
+        Example: P700 profiles from P900 site can be remapped to P900.
+        """
+        if printer_name in self.PRINTER_REMAPPINGS:
+            mapped_printer = self.PRINTER_REMAPPINGS[printer_name]
+            self.log(f"  Remapping printer: {printer_name} -> {mapped_printer}")
+            return mapped_printer
+        return printer_name
+
+    def extract_printer_and_paper_info(self, filename: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Extract printer name, paper brand, and paper type from filename.
+        Handles both ICC and EMY2 file naming patterns.
+
+        Returns:
+            Tuple of (printer_name, paper_brand, paper_type)
+        """
+        name_without_ext = Path(filename).stem
+
+        # Normalize plus signs to spaces (for files like "MOAB+Lasal+Gloss+PRO-100+OGP.icc")
+        name_without_ext = name_without_ext.replace('+', ' ')
+
+        # Pattern 1: MOAB profiles
+        # "MOAB Anasazi Canvas PRO-100 MPP" -> Printer, Brand, Type
+        # Also handles hyphenated models: "MOAB Anasazi Canvas Matte P7570-P9570 ECM"
+        if name_without_ext.startswith('MOAB '):
+            parts = name_without_ext[5:].split()  # Remove "MOAB " prefix
+
+            # Find printer model (PRO-100, P900, P7570, iPF6450)
+            printer_key = None
+            printer_idx = -1
+            for i, part in enumerate(parts):
+                # Check if this part matches any printer key (exact or partial match for hyphenated models)
+                for key in self.PRINTER_NAMES.keys():
+                    if part.lower() == key.lower() or part == key or key.lower() in part.lower():
+                        printer_key = key
+                        printer_idx = i
+                        break
+                if printer_idx > -1:
+                    break
+
+            if printer_idx > 0:
+                paper_type = ' '.join(parts[:printer_idx])
+                # Use the canonical key for lookup
+                printer_name = self.PRINTER_NAMES.get(printer_key, printer_key)
+                if not printer_name:
+                    # Fallback: try case-insensitive lookup
+                    for key, name in self.PRINTER_NAMES.items():
+                        if key.lower() == printer_key.lower():
+                            printer_name = name
+                            break
+                brand = self._normalize_brand_name('Moab')
+                printer_name = self._apply_printer_remapping(printer_name)
+                return printer_name, brand, paper_type
+
+        # Pattern 2: EPSON SC-P900 EMY2 files
+        # "EPSON SC-P900 Moab Entrada Rag Bright 190" -> Printer, Brand, Type
+        if name_without_ext.startswith('EPSON SC-'):
+            parts = name_without_ext.split()
+            if len(parts) >= 4:  # "EPSON SC-Pxxx Moab ..."
+                printer_model = parts[1]  # e.g., "SC-P900"
+                paper_brand = parts[2]  # e.g., "Moab"
+                paper_type = ' '.join(parts[3:]) if len(parts) > 3 else 'Unknown'
+
+                # Normalize printer model and brand
+                printer_name = self.PRINTER_NAMES.get(printer_model, f"Epson {printer_model}")
+                brand = self._normalize_brand_name(paper_brand)
+                printer_name = self._apply_printer_remapping(printer_name)
+                return printer_name, brand, paper_type
+
+        # Pattern 3: Canson/CIFA profiles
+        # "cifa_pixmapro100_baryta2_310" -> Brand, Printer, Type
+        if name_without_ext.startswith('cifa_'):
+            parts = name_without_ext[5:].split('_')  # Remove "cifa_" prefix
+            if len(parts) >= 2:
+                printer_key = parts[0]
+                paper_type = '_'.join(parts[1:])
+
+                printer_name = self.PRINTER_NAMES.get(printer_key, printer_key)
+                brand = self._normalize_brand_name('cifa')  # "cifa" -> "Canson"
+                printer_name = self._apply_printer_remapping(printer_name)
+                return printer_name, brand, paper_type
+
+        # Pattern 4: Hahnemuehle (HFA) profiles
+        # "HFA_Can6450_MK_PhotoRag308" or "HFAPhoto_Can6450_MK_..." -> Brand, Printer, Type
+        if name_without_ext.startswith('HFA'):
+            # Extract parts after HFA/HFAPhoto/HFAMetallic prefix
+            prefix_end = 0
+            if name_without_ext.startswith('HFAMetallic_'):
+                parts = name_without_ext[12:].split('_')  # Remove "HFAMetallic_" prefix
+            elif name_without_ext.startswith('HFAPhoto_'):
+                parts = name_without_ext[9:].split('_')  # Remove "HFAPhoto_" prefix
+            else:  # Just "HFA_"
+                parts = name_without_ext[4:].split('_')  # Remove "HFA_" prefix
+
+            if len(parts) >= 2:
+                printer_key = parts[0]
+                paper_type = '_'.join(parts[1:])
+
+                printer_name = self.PRINTER_NAMES.get(printer_key, printer_key)
+                brand = self._normalize_brand_name('HFA')  # "HFA" -> "Hahnemuehle"
+                printer_name = self._apply_printer_remapping(printer_name)
+                return printer_name, brand, paper_type
+
+        # Fallback: try to extract printer from filename
+        for key, full_name in self.PRINTER_NAMES.items():
+            if key.lower() in name_without_ext.lower():
+                # Try to extract paper type as everything except printer
+                paper_type = name_without_ext.lower().replace(key.lower(), '').strip()
+                full_name = self._apply_printer_remapping(full_name)
+                return full_name, 'Unknown', paper_type
+
+        return None, None, None
+
+    def generate_new_filename(self, printer: str, brand: str, paper_type: str,
+                             extension: str, existing_names: Dict[str, int]) -> str:
+        """
+        Generate standardized filename.
+
+        Format: Printer Name - Paper Brand - Paper Type [N].ext
+        Adds [N] if there are duplicates.
+        """
+        base_name = f"{printer} - {brand} - {paper_type}"
+
+        # Check if we need a number
+        if base_name in existing_names:
+            existing_names[base_name] += 1
+            return f"{base_name} [{existing_names[base_name]}].{extension}"
+        else:
+            existing_names[base_name] = 1
+            return f"{base_name}.{extension}"
+
+    def organize_profiles(self) -> bool:
+        """
+        Main function to organize ICC profiles and EMX files.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        self.log("=" * 60)
+        self.log("Starting ICC Profile Organization")
+        self.log(f"Mode: {'DRY RUN' if self.dry_run else 'EXECUTE'}")
+        self.log(f"Source directory: {self.profiles_dir}")
+        self.log(f"Output directory: {self.output_dir}")
+        self.log("=" * 60)
+
+        # Find all ICC, ICM, and EMY2 files
+        profile_files = self._find_profile_files()
+
+        if not profile_files:
+            self.log("No profile files found.", level='WARNING')
+            return False
+
+        self.log(f"\nFound {len(profile_files)} profile files:")
+        for ftype, files in profile_files.items():
+            self.log(f"  {ftype}: {len(files)} files")
+
+        # Process each profile type
+        all_files = []
+        for file_list in profile_files.values():
+            all_files.extend(file_list)
+
+        # Track existing names to handle duplicates
+        existing_names = defaultdict(int)
+
+        for file_path in all_files:
+            printer, brand, paper_type = self.extract_printer_and_paper_info(file_path.name)
+
+            if not printer or not brand:
+                self.log(f"  ⚠ Could not parse: {file_path.name}", level='WARNING')
+                continue
+
+            # Use interactive mode if enabled to choose printer for multi-printer files
+            printer = self._get_printer_name_interactive(file_path.name, printer)
+
+            # Determine extension
+            ext = file_path.suffix.lstrip('.')
+
+            # Generate new filename
+            new_filename = self.generate_new_filename(printer, brand, paper_type, ext, existing_names)
+
+            # Create new path: organized-profiles/Printer/Brand/filename
+            new_path = self.output_dir / printer / brand / new_filename
+
+            self.operations.append((file_path, new_path))
+
+            # Only print if detailed mode is enabled
+            if self.detailed:
+                self.log(f"  {file_path.name} -> {new_path.relative_to(self.output_dir.parent)}")
+
+        # Show summary organized by printer/brand
+        if not self.detailed:
+            self._print_organization_summary()
+
+        # Execute operations if not dry run
+        if not self.dry_run:
+            self._execute_operations()
+        else:
+            self.log("\n[DRY RUN] Use --execute flag to apply changes")
+
+        return True
+
+    def _print_organization_summary(self):
+        """Print a clean summary of how profiles will be organized."""
+        self.log("\nProfile Organization Summary:")
+        self.log("=" * 60)
+
+        # Group operations by destination printer and brand
+        summary = defaultdict(lambda: defaultdict(list))
+
+        for old_path, new_path in self.operations:
+            parts = new_path.parts
+            # Extract printer and brand from path
+            if len(parts) >= 2:
+                printer = parts[-3]  # profiles/Printer/Brand/file
+                brand = parts[-2]
+                filename = parts[-1]
+                summary[printer][brand].append(filename)
+
+        # Print organized summary
+        for printer in sorted(summary.keys()):
+            print(f"\n📁 {printer}/")
+            for brand in sorted(summary[printer].keys()):
+                file_count = len(summary[printer][brand])
+                print(f"   └─ {brand}/ ({file_count} files)")
+                # Show first 2-3 files as examples
+                for filename in sorted(summary[printer][brand])[:3]:
+                    print(f"      • {filename}")
+                if file_count > 3:
+                    print(f"      • ... and {file_count - 3} more")
+
+        total_files = len(self.operations)
+        self.log(f"\nTotal profiles to organize: {total_files}")
+
+    def organize_pdfs(self) -> bool:
+        """
+        Find, deduplicate, and organize PDF files.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        self.log("\n" + "=" * 60)
+        self.log("Starting PDF Organization")
+        self.log("=" * 60)
+
+        # Find all PDFs
+        pdf_files = list(self.profiles_dir.rglob('*.pdf'))
+
+        if not pdf_files:
+            self.log("No PDF files found.")
+            return True
+
+        self.log(f"Found {len(pdf_files)} PDF files")
+
+        # Calculate hashes and find duplicates
+        self._find_pdf_duplicates(pdf_files)
+
+        # Process PDFs
+        for file_path in pdf_files:
+            # Check if this is a duplicate (not the first occurrence)
+            file_hash = self._hash_file(file_path)
+
+            if file_hash in self.pdf_duplicates and self.pdf_duplicates[file_hash][0] != file_path:
+                # This is a duplicate
+                self.log(f"  DUPLICATE: {file_path.relative_to(self.profiles_dir)}")
+                self.files_deleted.append(str(file_path))
+
+                if not self.dry_run:
+                    file_path.unlink()
+                    self.log(f"    → Deleted")
+            else:
+                # This is a unique file, organize it
+                # Try to extract printer from filename or parent folder
+                printer = self._extract_printer_from_context(file_path)
+
+                if printer:
+                    new_path = self.output_dir / 'PDFs' / printer / file_path.name
+                    self.operations.append((file_path, new_path))
+                    if self.detailed:
+                        self.log(f"  {file_path.relative_to(self.profiles_dir)} -> PDFs/{printer}/{file_path.name}")
+
+        # Show PDF organization summary
+        if not self.detailed and len(self.operations) > 0:
+            self._print_pdf_organization_summary()
+
+        # Execute operations if not dry run
+        if not self.dry_run:
+            self._execute_operations()
+        else:
+            self.log("\n[DRY RUN] Use --execute flag to apply changes")
+
+        return True
+
+    def _print_pdf_organization_summary(self):
+        """Print a clean summary of how PDFs will be organized."""
+        self.log("\nPDF Organization Summary:")
+        self.log("=" * 60)
+
+        # Group PDF operations by destination printer
+        pdf_summary = defaultdict(list)
+
+        for old_path, new_path in self.operations:
+            parts = new_path.parts
+            # Check if this is a PDF operation (PDFs in path)
+            if 'PDFs' in parts:
+                # Extract printer from PDFs/Printer/filename
+                pdf_idx = parts.index('PDFs')
+                if pdf_idx + 1 < len(parts) - 1:
+                    printer = parts[pdf_idx + 1]
+                    filename = parts[-1]
+                    pdf_summary[printer].append(filename)
+
+        if pdf_summary:
+            for printer in sorted(pdf_summary.keys()):
+                file_count = len(pdf_summary[printer])
+                print(f"📄 PDFs/{printer}/ ({file_count} files)")
+            print(f"\nTotal PDFs to organize: {sum(len(v) for v in pdf_summary.values())}")
+            if self.files_deleted:
+                print(f"Duplicate PDFs removed: {len(self.files_deleted)}")
+
+    def _find_profile_files(self) -> Dict[str, List[Path]]:
+        """Find all ICC, ICM, and EMY2 files in the directory."""
+        icc_files = list(self.profiles_dir.rglob('*.icc'))
+        icm_files = list(self.profiles_dir.rglob('*.icm'))
+        emy2_files = list(self.profiles_dir.rglob('*.emy2'))
+
+        # Filter out macOS resource fork files
+        icc_files = [f for f in icc_files if '._' not in f.name]
+        icm_files = [f for f in icm_files if '._' not in f.name]
+        emy2_files = [f for f in emy2_files if '._' not in f.name]
+
+        return {
+            'ICC': icc_files,
+            'ICM': icm_files,
+            'EMY2': emy2_files,
+        }
+
+    def _find_pdf_duplicates(self, pdf_files: List[Path]):
+        """Find duplicate PDFs based on file hash."""
+        self.log("Checking for duplicate PDFs...")
+
+        for pdf_file in pdf_files:
+            file_hash = self._hash_file(pdf_file)
+            self.pdf_duplicates[file_hash].append(pdf_file)
+
+        duplicates_found = sum(1 for v in self.pdf_duplicates.values() if len(v) > 1)
+        self.log(f"Found {duplicates_found} duplicate sets")
+
+    def _hash_file(self, file_path: Path, chunk_size: int = 8192) -> str:
+        """Calculate SHA-256 hash of a file."""
+        sha256_hash = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(chunk_size), b''):
+                sha256_hash.update(chunk)
+        return sha256_hash.hexdigest()
+
+    def _extract_printer_from_context(self, file_path: Path) -> Optional[str]:
+        """Extract printer name from file path context."""
+        # Check parent directory name and all parents
+        for parent in [file_path.parent] + list(file_path.parents):
+            parent_name = parent.name
+
+            # Look for exact and case-insensitive matches
+            for key, full_name in self.PRINTER_NAMES.items():
+                if key.lower() in parent_name.lower():
+                    return full_name
+
+            # Special handling for patterns like "IPF 6450" vs "iPF6450"
+            if 'iPF6450' in parent_name or 'ipf6450' in parent_name or 'IPF 6450' in parent_name or 'ipf 6450' in parent_name:
+                return 'Canon iPF6450'
+            if 'PRO-100' in parent_name or 'Pro-100' in parent_name or 'pro-100' in parent_name:
+                return 'Canon Pixma PRO-100'
+
+        return 'Uncategorized'
+
+    def _execute_operations(self):
+        """Execute all file copy operations."""
+        self.log("\nExecuting file operations...")
+
+        for old_path, new_path in self.operations:
+            try:
+                # Create parent directories
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Copy file (preserves metadata like timestamps)
+                shutil.copy2(str(old_path), str(new_path))
+                self.files_renamed.append((str(old_path), str(new_path)))
+                self.log(f"  ✓ Copied: {old_path.name}")
+            except Exception as e:
+                self.log(f"  ✗ Error copying {old_path.name}: {e}", level='ERROR')
+
+    def update_profile_descriptions(self) -> bool:
+        """
+        Update ICC profile descriptions to match filenames.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        self.log("\n" + "=" * 60)
+        self.log("Updating ICC Profile Descriptions")
+        self.log("=" * 60)
+
+        if not self.output_dir.exists():
+            self.log("Output directory does not exist yet. Skipping description update.", level='WARNING')
+            return False
+
+        updater = ICCProfileUpdater(verbose=False)
+        processed, successful = updater.process_directory(self.output_dir, verbose=True)
+
+        self.log(f"  Updated {successful} / {processed} profiles")
+
+        return successful == processed
+
+    def print_summary(self):
+        """Print summary of operations."""
+        self.log("\n" + "=" * 60)
+        self.log("SUMMARY")
+        self.log("=" * 60)
+        self.log(f"Files processed: {len(self.operations)}")
+        self.log(f"Files copied: {len(self.files_renamed)}")
+        self.log(f"Duplicate PDFs removed: {len(self.files_deleted)}")
+
+        if self.files_renamed:
+            self.log("\nCopied files:")
+            for old, new in self.files_renamed[:5]:  # Show first 5
+                self.log(f"  {old} -> {new}")
+            if len(self.files_renamed) > 5:
+                self.log(f"  ... and {len(self.files_renamed) - 5} more")
+
+        if self.files_deleted:
+            self.log("\nDeleted files (duplicates):")
+            for file in self.files_deleted[:5]:  # Show first 5
+                self.log(f"  {file}")
+            if len(self.files_deleted) > 5:
+                self.log(f"  ... and {len(self.files_deleted) - 5} more")
+
+        self.log("=" * 60)
+
+
+def main():
+    """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Organize ICC profiles, EMX files, and PDFs'
+    )
+    parser.add_argument(
+        'profiles_dir',
+        nargs='?',
+        default='./profiles',
+        help='Path to source profiles directory (default: ./profiles)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        default=None,
+        help='Output directory for organized profiles (default: ./organized-profiles)'
+    )
+    parser.add_argument(
+        '--execute',
+        action='store_true',
+        help='Execute operations (default is dry-run mode)'
+    )
+    parser.add_argument(
+        '--profiles-only',
+        action='store_true',
+        help='Only organize profiles, skip PDFs'
+    )
+    parser.add_argument(
+        '--pdfs-only',
+        action='store_true',
+        help='Only organize PDFs, skip profiles'
+    )
+    parser.add_argument(
+        '--quiet',
+        action='store_true',
+        help='Suppress output'
+    )
+    parser.add_argument(
+        '--interactive',
+        action='store_true',
+        help='Interactively choose printer for files with multiple printer options'
+    )
+    parser.add_argument(
+        '--detailed',
+        action='store_true',
+        help='Show detailed file-by-file transformation list (default is summary)'
+    )
+    parser.add_argument(
+        '--skip-desc-update',
+        action='store_true',
+        help='Skip updating ICC profile descriptions to match filenames'
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.profiles_only and args.pdfs_only:
+        print("Error: Cannot use both --profiles-only and --pdfs-only")
+        sys.exit(1)
+
+    # Initialize organizer
+    organizer = ProfileOrganizer(
+        args.profiles_dir,
+        output_dir=args.output_dir,
+        dry_run=not args.execute,
+        verbose=not args.quiet,
+        interactive=args.interactive,
+        detailed=args.detailed,
+        update_descriptions=not args.skip_desc_update
+    )
+
+    # Run organization
+    try:
+        if not args.pdfs_only:
+            organizer.organize_profiles()
+
+        if not args.profiles_only:
+            organizer.organize_pdfs()
+
+        # Update profile descriptions if enabled and in execute mode
+        if organizer.update_descriptions and not organizer.dry_run:
+            organizer.update_profile_descriptions()
+
+        organizer.print_summary()
+
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
