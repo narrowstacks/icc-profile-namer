@@ -164,11 +164,11 @@ filename_patterns:
       format: true
       remove_brand: "Hahnemuehle"  # Strip brand name from paper type
 
-  # Pattern 5: Red River Papers (Epson profiles)
+  # Pattern 5: Red River Papers (ICC Profiles with Printer Info)
   # Examples: "RR Arctic Polar Luster Ep 7570-9750", "RR Palo Duro Matte Canvas P9570 P7570"
   - name: red_river_profiles
     priority: 75
-    description: "Red River Papers Epson profiles"
+    description: "Red River Papers ICC profiles"
     prefix: "RR "
     prefix_case_insensitive: false
     delimiter: " "
@@ -181,6 +181,22 @@ filename_patterns:
     paper_type_processing:
       format: true
       remove_brand: "Ep"  # Remove "Ep" prefix (Epson indicator)
+
+  # Pattern 5b: Red River Papers (EMY2 Documentation Files - No Printer in Filename)
+  # Examples: "Red River Paper_RR Arctic Polar Luster (75lb).emy2"
+  # Note: These are documentation files without printer info in filename
+  - name: red_river_emy2_files
+    priority: 74
+    description: "Red River Papers EMY2 documentation files"
+    prefix: "Red River Paper_RR "
+    prefix_case_insensitive: true
+    delimiter: " "
+    structure:
+      - field: paper_type
+        position: "0+"  # Everything after prefix is paper type
+    brand_value: "Red River"
+    paper_type_processing:
+      format: true
 
   # Pattern 6: Fallback - substring printer detection
   # Used when specific patterns don't match

@@ -298,33 +298,45 @@ Handles Hahnemuehle profiles with multiple prefix variants.
 - Hahnemuehle brand name removed from paper type strings
 - MK/PK markers automatically stripped from output
 
-#### 5. **Red River Papers** (Priority: 75)
-Handles Red River Papers profiles for multiple printer models with flexible format variations.
+#### 5. Red River Papers (Priority 75-74)
+Handles Red River Papers profiles and documentation files across multiple printer models.
 
-**Format:** `RR [PaperType...] [PrinterInfo]`
+**Format (ICC Profiles):** `RR [PaperType...] [PrinterInfo]`
 
-**Supported Printer Models:**
+**Format (EMY2 Documentation):** `Red River Paper_RR [PaperType]`
+
+**Supported Printer Models (ICC Profiles with printer in filename):**
+
 - **Epson P7570 & P9570** - `RR [Type] Ep 7570-9570` or `RR [Type] P9570 P7570`
 - **Epson P900** - `RR [Type] EpP900` or `RR [Type] Ep P900` or `RR [Type] Ep SureColor P900`
 - **Canon Pixma PRO-100** - `RR [Type] CanPRO-100` or `RR [Type] Can PRO-100`
 - **Canon iPF6400** - `RR [Type] Can IPF6400` or `RR [Type] Can iPFX400`
 
-**Examples:**
+**Examples (ICC Profiles):**
+
 - `RR Arctic Polar Luster Ep 7570-9750.icc` → Printer: Epson P7570, Brand: Red River, Type: Arctic Polar Luster
 - `RR Palo Duro Matte Canvas P9570 P7570.icc` → Printer: Epson P7570, Brand: Red River, Type: Palo Duro Matte Canvas
 - `RR Arctic Polar Luster EpP900.icc` → Printer: Epson P900, Brand: Red River, Type: Arctic Polar Luster
 - `RR Palo Duro Baryta CanPRO-100.icc` → Printer: Canon Pixma PRO-100, Brand: Red River, Type: Palo Duro Baryta
-- `RR APLuster Can iPFX400.icc` → Printer: Canon iPF6450, Brand: Red River, Type: AP Luster Can
+
+**Examples (EMY2 Documentation Files):**
+
+- `Red River Paper_RR Arctic Polar Luster (75lb).emy2` → Printer: Unknown, Brand: Red River, Type: Arctic Polar Luster
+- `Red River Paper_RR Aurora Natural 250.emy2` → Printer: Unknown, Brand: Red River, Type: Aurora Natural 250
+- `Red River Paper_RR Palo Duro Baryta.emy2` → Printer: Unknown, Brand: Red River, Type: Palo Duro Baryta
 
 **Features:**
-- "RR" prefix detection (not case-insensitive as it's distinctive)
+
+- "RR" prefix detection for ICC profiles (not case-insensitive as it's distinctive)
+- "Red River Paper_RR" prefix detection for EMY2 documentation files (case-insensitive)
 - Flexible printer format handling across all supported models
 - Removes "Ep" prefix from paper types
 - Supports hyphenated and space-separated printer models
 - Handles both manufacturer prefixes (Ep, Can) and explicit printer models
 - Automatically maps generic iPFX400 to Canon iPF6450
+- EMY2 files without printer info default to "Unknown" printer with "Red River" brand
 
-#### 6. **Fallback Printer Detection** (Priority: 10)
+#### 6. Fallback Printer Detection (Priority 10)
 Last resort pattern that searches for any printer key in the filename.
 
 **Format:** `[AnyText][PrinterKey][AnyText]`
@@ -424,7 +436,7 @@ Some patterns need multiple prefix options:
 
 Patterns are evaluated in order of priority (highest first). The first pattern that matches is used. Example:
 
-```
+```text
 1. MOAB Profiles (priority: 100)
 2. EPSON SC- (priority: 90)
 3. HFA (priority: 85)
@@ -530,7 +542,7 @@ python3 organize_profiles.py ./profiles --execute --no-system-profiles-prompt
 
 Some profiles work with multiple printers (e.g., `MOAB Anasazi Canvas Matte P7570-P9570 ECM.icc`).
 
-### How it works:
+### How it works
 
 1. First time seeing a combo, you're prompted to choose a printer
 2. Your choice is saved as a global rule in `.profile_preferences.json`
@@ -589,7 +601,7 @@ On macOS, you have two options:
 - No admin privileges required
 - Recommended for personal use
 
-#### macOS Usage:
+#### macOS Usage
 
 ```bash
 # Normal flow - prompts you to choose system or user directory
@@ -630,7 +642,7 @@ On Windows, the system ICC profile directory requires administrator privileges:
 
 **System Directory Path:** `C:\Windows\System32\spool\drivers\color`
 
-#### Windows Usage:
+#### Windows Usage
 
 ```bash
 # Without admin - will error with clear instructions
@@ -646,9 +658,9 @@ python3 organize_profiles.py ./profiles --execute --system-profiles
 #   2. Run the program again with the --system-profiles flag
 ```
 
-#### Windows: Run with Admin Privileges
+#### Windows Run with Admin Privileges
 
-1. **Open Command Prompt or PowerShell as Administrator:**
+1. **Open Command Prompt or PowerShell as Administrator**
 
    - Press `Win + X` and select "Command Prompt (Admin)" or "PowerShell (Admin)"
    - Or: Right-click Command Prompt/PowerShell → "Run as administrator"
@@ -673,7 +685,7 @@ The programs respects each OS's requirements:
 
 **macOS:** Preserves your organized folder structure
 
-```
+```text
 ~/Library/ColorSync/Profiles/
 ├── Canon Pixma PRO-100/
 │   ├── Canson/
@@ -686,7 +698,7 @@ The programs respects each OS's requirements:
 
 **Windows:** Uses flat structure (no subdirectories)
 
-```
+```text
 C:\Windows\System32\spool\drivers\color\
 ├── Canon Pixma PRO-100 - Canson - aqua240.icc
 ├── Canon Pixma PRO-100 - Moab - Anasazi Canvas.icc

@@ -391,17 +391,22 @@ class PatternMatcher:
             if value is not None:
                 extracted[field_def.field] = value
 
-        # Validate we got required fields
-        if 'printer' not in extracted:
-            return None
-
-        # Get paper brand
+        # Get paper brand first
         if pattern.brand_value is not None:
             brand = pattern.brand_value
         elif 'brand' in extracted:
             brand = extracted['brand']
         else:
             brand = 'Unknown'
+
+        # Validate we got required fields
+        # Printer is optional if brand_value is explicitly set (e.g., for EMY2 documentation files)
+        if 'printer' not in extracted:
+            if pattern.brand_value is None and brand == 'Unknown':
+                # No printer and no explicit brand = fail
+                return None
+            # Use 'Unknown' for printer when no printer info in filename but brand is set
+            extracted['printer'] = 'Unknown'
 
         # Normalize brand
         brand = self._normalize_brand(brand)
@@ -853,11 +858,11 @@ class ProfileOrganizer:
                     PatternVariant('HFA_', 4),
                 ],
             ),
-            # Red River Papers pattern
+            # Red River Papers pattern (ICC profiles)
             FilenamePattern(
                 name='red_river_profiles',
                 priority=75,
-                description='Red River Papers Epson profiles',
+                description='Red River Papers ICC profiles',
                 prefix='RR ',
                 prefix_case_insensitive=False,
                 delimiter=' ',
@@ -867,6 +872,20 @@ class ProfileOrganizer:
                 ],
                 brand_value='Red River',
                 paper_type_processing=PaperTypeProcessing(format=True, remove_brand='Ep'),
+            ),
+            # Red River Papers EMY2 pattern (documentation files without printer info)
+            FilenamePattern(
+                name='red_river_emy2_files',
+                priority=74,
+                description='Red River Papers EMY2 documentation files',
+                prefix='Red River Paper_RR ',
+                prefix_case_insensitive=True,
+                delimiter=' ',
+                structure=[
+                    FieldDefinition('paper_type', position='0+'),
+                ],
+                brand_value='Red River',
+                paper_type_processing=PaperTypeProcessing(format=True),
             ),
             # Fallback pattern
             FilenamePattern(
