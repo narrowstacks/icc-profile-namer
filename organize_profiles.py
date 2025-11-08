@@ -10,6 +10,7 @@ import shutil
 import hashlib
 import json
 import struct
+import platform
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
@@ -30,6 +31,20 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
     print("Warning: PIL not available. Install with: pip install Pillow")
+
+
+# System ICC profile paths by OS
+SYSTEM_ICC_PATHS = {
+    'Darwin': {
+        'system': Path('/Library/ColorSync/Profiles'),
+        'user': Path.home() / 'Library' / 'ColorSync' / 'Profiles',
+    },
+    'Windows': Path('C:\\Windows\\System32\\spool\\drivers\\color'),
+}
+
+# Detect current OS
+CURRENT_OS = platform.system()
+SYSTEM_ICC_PATH = SYSTEM_ICC_PATHS.get(CURRENT_OS)
 
 
 class ICCProfileUpdater:
@@ -358,6 +373,9 @@ class ProfileOrganizer:
         # Global preferences for printer conflicts (e.g., when P7570 and P9570 appear together)
         self.preferences_path = self.profiles_dir.parent / '.profile_preferences.json'
         self.global_preferences = self._load_global_preferences()
+
+        # Track selected system profile directory
+        self.selected_system_profile_path = None
 
         if not self.profiles_dir.exists():
             self.log(f"Error: {self.profiles_dir} does not exist", level='ERROR')
@@ -1025,6 +1043,191 @@ class ProfileOrganizer:
             except Exception as e:
                 self.log(f"  ✗ Error copying {old_path.name}: {e}", level='ERROR')
 
+    def _get_system_profile_paths(self) -> Optional[dict]:
+        """Get the system ICC profile paths for the current OS."""
+        return SYSTEM_ICC_PATH
+
+    def _check_windows_elevated(self) -> bool:
+        """
+        Check if running with elevated privileges on Windows.
+        Returns True if elevated or not on Windows, False if on Windows without elevation.
+        """
+        if CURRENT_OS != 'Windows':
+            return True
+
+        try:
+            import ctypes
+            return ctypes.windll.shell.IsUserAnAdmin()
+        except Exception:
+            # If we can't determine, try to check write access directly
+            return os.access(str(SYSTEM_ICC_PATHS['Windows']), os.W_OK)
+
+    def prompt_for_system_profile_export(self) -> bool:
+        """
+        Prompt user if they want to copy profiles to system ICC directory.
+        On Windows, checks for elevated privileges first.
+        On macOS, asks user to choose between system and user directory.
+
+        Returns:
+            True if user wants to copy, False otherwise
+        """
+        paths = self._get_system_profile_paths()
+        if not paths:
+            return False
+
+        # Windows: Check for elevated privileges
+        if CURRENT_OS == 'Windows':
+            if not self._check_windows_elevated():
+                print("\n" + "=" * 60)
+                print("Elevated Privileges Required")
+                print("=" * 60)
+                print("ERROR: Cannot write to Windows system ICC profile directory")
+                print(f"Path: {SYSTEM_ICC_PATHS['Windows']}")
+                print("\nThis directory requires Administrator privileges.")
+                print("\nTo fix this, please:")
+                print("  1. Open Command Prompt or PowerShell as Administrator")
+                print("  2. Run the program again with the --system-profiles flag")
+                print("=" * 60)
+                return False
+
+            system_path = SYSTEM_ICC_PATHS['Windows']
+            print("\n" + "=" * 60)
+            print("System ICC Profile Directory Found")
+            print("=" * 60)
+            print(f"Path: {system_path}")
+            print("\nNote: Profiles will be copied to a flat structure")
+            print("      (no subdirectories will be created in Windows system folder)")
+
+            print("\nWould you like to copy the organized profiles to the system")
+            print("ICC profile directory?")
+
+            while True:
+                response = input("\nCopy to system profiles? (yes/no): ").strip().lower()
+                if response in ['yes', 'y']:
+                    self.selected_system_profile_path = system_path
+                    return True
+                elif response in ['no', 'n']:
+                    return False
+                else:
+                    print("Please enter 'yes' or 'no'")
+
+        # macOS: Offer choice between system and user directory
+        else:  # Darwin
+            system_path = paths['system']
+            user_path = paths['user']
+
+            print("\n" + "=" * 60)
+            print("ICC Profile Directory Options")
+            print("=" * 60)
+            print(f"\n1. System Directory (requires admin)")
+            print(f"   Path: {system_path}")
+            print(f"   Profiles available to all users")
+
+            print(f"\n2. User Directory (no admin needed)")
+            print(f"   Path: {user_path}")
+            print(f"   Profiles available only to you")
+
+            print(f"\nProfiles will be organized with folder structure")
+
+            while True:
+                response = input("\nChoose directory (1/2) or 'skip': ").strip().lower()
+                if response in ['1', 'system']:
+                    system_path.parent.mkdir(parents=True, exist_ok=True)
+                    if not os.access(str(system_path.parent), os.W_OK):
+                        print(f"\nError: No write permission to {system_path.parent}")
+                        print("Try running with: sudo python3 organize_profiles.py ...")
+                        continue
+
+                    self.selected_system_profile_path = system_path
+                    return True
+                elif response in ['2', 'user']:
+                    # Ensure user directory exists
+                    user_path.mkdir(parents=True, exist_ok=True)
+                    self.selected_system_profile_path = user_path
+                    return True
+                elif response in ['skip', 's', 'n', 'no']:
+                    return False
+                else:
+                    print("Please enter '1', '2', or 'skip'")
+
+    def copy_to_system_profiles(self) -> bool:
+        """
+        Copy organized profiles to system ICC profile directory.
+        Uses the path selected during prompt_for_system_profile_export().
+        Handles OS-specific requirements:
+        - Windows: Flat structure (no subdirectories)
+        - macOS: Preserves organized folder structure
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.selected_system_profile_path:
+            self.log(f"Error: No system profile path selected", level='ERROR')
+            return False
+
+        system_path = self.selected_system_profile_path
+
+        if not system_path.exists():
+            self.log(f"Error: System profile path does not exist: {system_path}", level='ERROR')
+            return False
+
+        self.log("\n" + "=" * 60)
+        self.log(f"Copying profiles to: {system_path}")
+        self.log("=" * 60)
+
+        # Check if we have write permissions
+        if not os.access(str(system_path.parent), os.W_OK):
+            self.log(f"Error: No write permission to {system_path}", level='ERROR')
+            if CURRENT_OS == 'Darwin' and '/Library/ColorSync' in str(system_path):
+                self.log("Note: Run with 'sudo' to write to system directory")
+            return False
+
+        copied_count = 0
+        failed_count = 0
+
+        if CURRENT_OS == 'Windows':
+            # Windows: Flat structure - copy all profiles directly to the color folder
+            self.log("Using flat structure for Windows system profiles...")
+
+            for file_path in self.output_dir.rglob('*'):
+                if file_path.is_file() and file_path.suffix.lower() in ['.icc', '.icm']:
+                    try:
+                        # Copy directly to system profile folder (flat structure)
+                        dest_path = system_path / file_path.name
+                        shutil.copy2(str(file_path), str(dest_path))
+                        self.log(f"  ✓ Copied: {file_path.name}")
+                        copied_count += 1
+                    except Exception as e:
+                        self.log(f"  ✗ Error copying {file_path.name}: {e}", level='ERROR')
+                        failed_count += 1
+
+        else:  # macOS and others
+            # Preserve folder structure
+            self.log("Using organized folder structure for system profiles...")
+
+            for file_path in self.output_dir.rglob('*'):
+                if file_path.is_file() and file_path.suffix.lower() in ['.icc', '.icm']:
+                    try:
+                        # Preserve relative path from output_dir
+                        rel_path = file_path.relative_to(self.output_dir)
+                        dest_path = system_path / rel_path
+
+                        # Create parent directories
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        shutil.copy2(str(file_path), str(dest_path))
+                        self.log(f"  ✓ Copied: {rel_path}")
+                        copied_count += 1
+                    except Exception as e:
+                        self.log(f"  ✗ Error copying {file_path.name}: {e}", level='ERROR')
+                        failed_count += 1
+
+        self.log(f"\nSuccessfully copied: {copied_count} profiles")
+        if failed_count > 0:
+            self.log(f"Failed to copy: {failed_count} profiles", level='WARNING')
+
+        return failed_count == 0
+
     def update_profile_descriptions(self) -> bool:
         """
         Update ICC profile descriptions to match filenames.
@@ -1126,6 +1329,16 @@ def main():
         action='store_true',
         help='Skip updating ICC profile descriptions to match filenames'
     )
+    parser.add_argument(
+        '--system-profiles',
+        action='store_true',
+        help='Copy organized profiles to system ICC profile directory (prompts if system directory found)'
+    )
+    parser.add_argument(
+        '--no-system-profiles-prompt',
+        action='store_true',
+        help='Do not prompt to copy to system ICC profile directory'
+    )
 
     args = parser.parse_args()
 
@@ -1158,6 +1371,19 @@ def main():
             organizer.update_profile_descriptions()
 
         organizer.print_summary()
+
+        # Handle system profile export
+        should_export_to_system = False
+        if not organizer.dry_run:
+            if args.system_profiles:
+                # User explicitly requested system profiles via flag
+                should_export_to_system = True
+            elif not args.no_system_profiles_prompt:
+                # Prompt user if system directory is accessible
+                should_export_to_system = organizer.prompt_for_system_profile_export()
+
+            if should_export_to_system:
+                organizer.copy_to_system_profiles()
 
     except KeyboardInterrupt:
         print("\n\nOperation cancelled by user")

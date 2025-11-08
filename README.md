@@ -129,6 +129,12 @@ python3 organize_profiles.py ./profiles --pdfs-only --execute
 
 # Suppress output
 python3 organize_profiles.py ./profiles --quiet
+
+# Copy to system ICC profile directory (prompts if available)
+python3 organize_profiles.py ./profiles --execute --system-profiles
+
+# Skip the system profile prompt
+python3 organize_profiles.py ./profiles --execute --no-system-profiles-prompt
 ```
 
 ## Multi-Printer Profile Handling
@@ -171,11 +177,132 @@ organized-profiles/
 
 Your original `profiles/` directory remains unchanged.
 
+## System ICC Profile Directory Support
+
+After organizing profiles, you can automatically copy them to your system's ICC profile directory, making them available to all applications.
+
+### macOS - Choose Your Installation Scope
+
+On macOS, you have two options:
+
+**Option 1: System Directory** (requires admin)
+- Path: `/Library/ColorSync/Profiles`
+- Profiles available to all users on the computer
+- Requires `sudo` or admin password
+- Recommended for shared computers
+
+**Option 2: User Directory** (no admin needed)
+- Path: `~/Library/ColorSync/Profiles`
+- Profiles available only to your user account
+- No admin privileges required
+- Recommended for personal use
+
+#### macOS Usage:
+
+```bash
+# Normal flow - prompts you to choose system or user directory
+python3 organize_profiles.py ./profiles --execute
+
+# Output will show:
+# ICC Profile Directory Options
+# 1. System Directory (requires admin)
+#    Path: /Library/ColorSync/Profiles
+# 2. User Directory (no admin needed)
+#    Path: ~/Library/ColorSync/Profiles
+# Choose directory (1/2) or 'skip':
+```
+
+If you choose the system directory and don't have permission, the program will suggest:
+```bash
+sudo python3 organize_profiles.py ./profiles --execute --system-profiles
+```
+
+#### macOS: Set Ownership (Optional One-Time Setup)
+
+To avoid needing `sudo` every time, you can change directory ownership:
+
+```bash
+# Change system color profiles directory to your user
+sudo chown -R $(whoami) /Library/ColorSync/Profiles
+
+# Verify ownership changed
+ls -ld /Library/ColorSync/Profiles
+```
+
+After this, you can copy profiles without `sudo`.
+
+### Windows - Administrator Required
+
+On Windows, the system ICC profile directory requires administrator privileges:
+
+**System Directory Path:** `C:\Windows\System32\spool\drivers\color`
+
+#### Windows Usage:
+
+```bash
+# Without admin - will error with clear instructions
+python3 organize_profiles.py ./profiles --execute --system-profiles
+
+# Output will show:
+# Elevated Privileges Required
+# ERROR: Cannot write to Windows system ICC profile directory
+# Path: C:\Windows\System32\spool\drivers\color
+# This directory requires Administrator privileges.
+# To fix this, please:
+#   1. Open Command Prompt or PowerShell as Administrator
+#   2. Run the program again with the --system-profiles flag
+```
+
+#### Windows: Run with Admin Privileges
+
+1. **Open Command Prompt or PowerShell as Administrator:**
+   - Press `Win + X` and select "Command Prompt (Admin)" or "PowerShell (Admin)"
+   - Or: Right-click Command Prompt/PowerShell → "Run as administrator"
+
+2. **Run the script:**
+   ```bash
+   python organize_profiles.py ./profiles --execute --system-profiles
+   ```
+
+3. **Note:** Profiles are copied to a flat structure (no subdirectories) as required by Windows.
+
+### Command-Line Flags for System Profiles
+
+- `--system-profiles` - Automatically copy to system ICC directory without prompting
+- `--no-system-profiles-prompt` - Skip the system profile prompt entirely
+- Default behavior (no flags) - Prompts if system directory is accessible
+
+### Profile Directory Organization
+
+The programs respects each OS's requirements:
+
+**macOS:** Preserves your organized folder structure
+```
+~/Library/ColorSync/Profiles/
+├── Canon Pixma PRO-100/
+│   ├── Canson/
+│   │   ├── Canon Pixma PRO-100 - Canson - aqua240.icc
+│   │   └── ...
+│   └── Moab/
+└── Epson P900/
+    └── ...
+```
+
+**Windows:** Uses flat structure (no subdirectories)
+```
+C:\Windows\System32\spool\drivers\color\
+├── Canon Pixma PRO-100 - Canson - aqua240.icc
+├── Canon Pixma PRO-100 - Moab - Anasazi Canvas.icc
+├── Epson P900 - Moab - Entrada Rag.icc
+└── ...
+```
+
 ## Features
 
 ✅ **Smart Parsing** - Auto-detects and parses profiles from various manufacturers
 ✅ **Duplicate Handling** - SHA-256 hash-based PDF duplicate detection
 ✅ **Multi-Printer Support** - Interactive or rule-based handling
+✅ **System Profile Installation** - Copy organized profiles to system ICC directories (macOS & Windows)
 ✅ **Safe Operations** - Dry-run by default, no modifications without `--execute`
 ✅ **Flexible Configuration** - Optional YAML config with sensible defaults
 ✅ **Detailed Logging** - All operations logged to `profile_organizer.log`
@@ -194,7 +321,33 @@ Your original `profiles/` directory remains unchanged.
 - Edit `.profile_preferences.json` directly
 - Or delete the file and rerun with `--interactive`
 
+### System Profile Directory Issues
+
+**macOS: "No write permission" when choosing system directory:**
+
+- The system directory `/Library/ColorSync/Profiles` requires admin access
+- Choose option 2 (User Directory) instead, which doesn't require admin
+- Or run with `sudo`: `sudo python3 organize_profiles.py ./profiles --execute --system-profiles`
+- One-time setup to avoid sudo: `sudo chown -R $(whoami) /Library/ColorSync/Profiles`
+
+**Windows: "Elevated Privileges Required" error:**
+
+- Windows requires administrator privileges to write to the system profile directory
+- Right-click Command Prompt/PowerShell → "Run as administrator"
+- Then run: `python organize_profiles.py ./profiles --execute --system-profiles`
+
+**Profiles aren't showing up in applications after copying:**
+
+- macOS: Restart the application or restart your computer
+- Windows: Some applications cache profiles on startup; restart them
+- Try logging out and back in (macOS) or restarting (Windows) for guaranteed refresh
+
+**Permission denied when copying to user directory (macOS):**
+
+- Ensure the `~/Library/ColorSync` directory exists and you own it
+- The script will create it automatically if it doesn't exist
+- If issues persist, create it manually: `mkdir -p ~/Library/ColorSync/Profiles`
+
 ## Logging
 
 All operations are logged to `profile_organizer.log` with timestamps and detailed information.
-
