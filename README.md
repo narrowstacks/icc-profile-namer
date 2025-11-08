@@ -709,14 +709,23 @@ C:\Windows\System32\spool\drivers\color\
 ## Features
 
 ✅ **Interactive TUI** - Build and manage configuration with an easy-to-use terminal interface
+
 ✅ **Generalized Pattern Matching** - Define custom filename parsing patterns in config.yaml without code changes
+
 ✅ **Smart Parsing** - Auto-detects and parses profiles from MOAB, EPSON, Canson, Hahnemuehle, and custom formats
+
 ✅ **Flexible Field Extraction** - Position-based, range-based, and search-based field extraction
+
 ✅ **Duplicate Handling** - SHA-256 hash-based PDF duplicate detection
+
 ✅ **Multi-Printer Support** - Interactive or rule-based handling
+
 ✅ **System Profile Installation** - Copy organized profiles to system ICC directories (macOS & Windows)
+
 ✅ **Safe Operations** - Dry-run by default, no modifications without `--execute`
+
 ✅ **Flexible Configuration** - Optional YAML config with sensible defaults and pattern definitions
+
 ✅ **Detailed Logging** - All operations logged to `profile_organizer.log`
 
 ## Troubleshooting
