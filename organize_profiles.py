@@ -457,6 +457,40 @@ class ProfileOrganizer:
             return self.BRAND_NAME_MAPPINGS[brand]
         return brand
 
+    def _format_paper_type(self, paper_type: str, remove_brand: Optional[str] = None) -> str:
+        """
+        Format paper type by separating CamelCase and optionally removing brand names.
+
+        Args:
+            paper_type: The paper type string to format
+            remove_brand: Optional brand name to remove (e.g., "Hahnemuehle")
+
+        Example: "PhotoLuster260" -> "Photo Luster 260"
+                 "HahnemuehlePhotoLuster260" -> "Photo Luster 260" (with remove_brand="Hahnemuehle")
+        """
+        import re
+
+        cleaned = paper_type
+
+        # Remove brand name if specified (case-insensitive)
+        if remove_brand:
+            cleaned = re.sub(re.escape(remove_brand), '', cleaned, flags=re.IGNORECASE)
+
+        # Replace underscores and plus signs with spaces
+        cleaned = cleaned.replace('_', ' ').replace('+', ' ')
+
+        # Separate CamelCase by inserting spaces before capital letters
+        # This pattern matches: capital letter followed by lowercase letters
+        cleaned = re.sub(r'([A-Z][a-z]+)', r' \1', cleaned)
+
+        # Also handle numbers: insert space before number sequences that come after letters
+        cleaned = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', cleaned)
+
+        # Clean up multiple spaces
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        return cleaned
+
     def _load_choices_cache(self) -> Dict:
         """Load user choices from cache file."""
         if self.choices_cache_path.exists():
@@ -631,8 +665,11 @@ class ProfileOrganizer:
         # Pattern 1: MOAB profiles
         # "MOAB Anasazi Canvas PRO-100 MPP" -> Printer, Brand, Type
         # Also handles hyphenated models: "MOAB Anasazi Canvas Matte P7570-P9570 ECM"
-        if name_without_ext.startswith('MOAB '):
-            parts = name_without_ext[5:].split()  # Remove "MOAB " prefix
+        # Case-insensitive: handles "MOAB", "Moab", "moab" variants
+        if name_without_ext.upper().startswith('MOAB '):
+            # Skip past the "MOAB " prefix (5 chars), handling any case variant
+            moab_end = name_without_ext.find(' ') + 1
+            parts = name_without_ext[moab_end:].split()
 
             # Find printer model (PRO-100, P900, P7570, iPF6450)
             printer_key = None
@@ -649,6 +686,8 @@ class ProfileOrganizer:
 
             if printer_idx > 0:
                 paper_type = ' '.join(parts[:printer_idx])
+                # Format paper type: separate CamelCase
+                paper_type = self._format_paper_type(paper_type)
                 # Use the canonical key for lookup
                 printer_name = self.PRINTER_NAMES.get(printer_key, printer_key)
                 if not printer_name:
@@ -669,6 +708,8 @@ class ProfileOrganizer:
                 printer_model = parts[1]  # e.g., "SC-P900"
                 paper_brand = parts[2]  # e.g., "Moab"
                 paper_type = ' '.join(parts[3:]) if len(parts) > 3 else 'Unknown'
+                # Format paper type: separate CamelCase
+                paper_type = self._format_paper_type(paper_type)
 
                 # Normalize printer model and brand
                 printer_name = self.PRINTER_NAMES.get(printer_model, f"Epson {printer_model}")
@@ -683,6 +724,8 @@ class ProfileOrganizer:
             if len(parts) >= 2:
                 printer_key = parts[0]
                 paper_type = '_'.join(parts[1:])
+                # Format paper type: separate CamelCase
+                paper_type = self._format_paper_type(paper_type)
 
                 printer_name = self.PRINTER_NAMES.get(printer_key, printer_key)
                 brand = self._normalize_brand_name('cifa')  # "cifa" -> "Canson"
@@ -704,6 +747,8 @@ class ProfileOrganizer:
             if len(parts) >= 2:
                 printer_key = parts[0]
                 paper_type = '_'.join(parts[1:])
+                # Format paper type: remove Hahnemuehle brand name and separate by capitals
+                paper_type = self._format_paper_type(paper_type, remove_brand='Hahnemuehle')
 
                 printer_name = self.PRINTER_NAMES.get(printer_key, printer_key)
                 brand = self._normalize_brand_name('HFA')  # "HFA" -> "Hahnemuehle"
@@ -715,6 +760,8 @@ class ProfileOrganizer:
             if key.lower() in name_without_ext.lower():
                 # Try to extract paper type as everything except printer
                 paper_type = name_without_ext.lower().replace(key.lower(), '').strip()
+                # Format paper type: separate CamelCase
+                paper_type = self._format_paper_type(paper_type)
                 full_name = self._apply_printer_remapping(full_name)
                 return full_name, 'Unknown', paper_type
 
